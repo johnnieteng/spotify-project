@@ -1,0 +1,241 @@
+---
+title: "Spotify Recommendation Engine"
+author: "Johnnie Teng"
+output: 
+  html_document:
+    toc: yes
+    toc_depth: '3'
+    toc_float: yes
+---
+
+```{r setup, echo=FALSE}
+library(knitr)
+library(kableExtra)
+mean_tempo <- 119.7193
+sd_tempo <- 29.13507
+mean_loudness <- -8.757001
+sd_loudness <- 5.685916
+```
+
+##Introduction
+
+Being a heavy Spotify user curious about big data, I have always been intrigued by the data insights Spotify generates, from classic recomendation features like Discover Weekly, to the ever-amusing Spotify Wrapped. One feature I have been utilizing a lot lately is Song Radio, generating playlists based on any given song, so I have decided to dig in to the Spotify API to see how I could build a similar recommendation engine.
+
+-- **To see the final product in a Shiny app, [click here](https://johnnieteng.shinyapps.io/spotify_rec_shiny/)** --
+
+For this project, I am using the `spotifyr` package to make API calls directly into RStudio. The package is no longer available on CRAN, nor is it being updated by the orginal creator Charlie Thompson, so I downloaded an old version from the CRAN archives.
+
+This script will require the following libraries:
+```{r libraries, message=FALSE}
+library(spotifyr)
+library(tidyverse)
+library(stats)
+library(plotly)
+library(random)
+library(ggcorrplot)
+```
+
+To allow access to the API, we run the following lines. Since two of the default scopes used in `get_spotify_authorization_code()` are no longer available, I removed the scopes and set a new authorization code to make calls.
+```{r secret, echo = FALSE}
+id <- "3187ec99a30d49a3bb0861b6013e0ead"
+secret <- "a4c789ca49534b6e924ba0cbdb33aae6"
+Sys.setenv(SPOTIFY_CLIENT_ID = id)
+Sys.setenv(SPOTIFY_CLIENT_SECRET = secret)
+access_token <- get_spotify_access_token()
+scopes <- spotifyr::scopes
+scopes <- scopes[c(-11,-12)]
+authorization_code <- get_spotify_authorization_code(scope = scopes)
+```
+
+```{r notsecret, eval=FALSE}
+id <- "my client id"
+secret <- "my client secret"
+Sys.setenv(SPOTIFY_CLIENT_ID = id)
+Sys.setenv(SPOTIFY_CLIENT_SECRET = secret)
+access_token <- get_spotify_access_token()
+scopes <- spotifyr::scopes
+scopes <- scopes[c(-11,-12)]
+authorization_code <- get_spotify_authorization_code(scope = scopes)
+```
+
+## Data Exploration
+###Song Selection
+First, we will select a song to generate recommendations around. To do so, I use the `search_spotify()` function, which returns basic information about the track, and `get_track_audio_features()`, which returns its audio features. I then created a new function called `get_features()` that merges the two and keeps only relevant columns. The code I wrote for `get_features()` is masked from this markdown for concision purposes.
+
+In the R console, the user will enter their search when prompted by `readline()`. In my [Shiny app](https://johnnieteng.shinyapps.io/spotify_rec_shiny/), user input is drawn using `textInput()`. For the purpose of this markdown, we will generate recommendations for *Be Like That*, a country-pop crossover by Kane Brown featuring Swae Lee and Khalid.
+```{r get_features function, echo = FALSE}
+get_features <- function(df_track){
+  track_features <- get_track_audio_features(df_track$id)
+  track_features <- track_features %>%
+    select(danceability, energy, key, loudness, mode, speechiness, acousticness, instrumentalness, liveness, 
+           valence, tempo, id)
+  track <- merge(df_track, track_features, by = "id")
+  track <- track %>%
+    select(id, artists, duration_ms, explicit, name, popularity, album.id, album.name, album.release_date, 
+           danceability, energy, key, loudness, mode, speechiness, acousticness, instrumentalness, liveness, 
+           valence, tempo, id)
+  return(track)
+}
+search <- "be like that"
+track <- search_spotify(search, "track")[1,]
+track <- get_features(track)
+artist <- track$artists[[1]]
+artist_id <- artist$id[1]
+track$artists <- paste(c(track$artists[[1]]$name), collapse=", ")
+```
+
+```{r search, eval = FALSE}
+search <- readline(prompt = "Search for a song: ")
+track <- search_spotify(search, "track")[1,]
+track <- get_features(track)
+artist <- track$artists[[1]]
+artist_id <- artist$id[1]
+```
+
+```{r track table, echo = FALSE}
+kable(track) %>%
+  kable_styling() %>%
+  kableExtra::scroll_box(width = "100%")
+```
+
+###Random Sampling
+To build the recommendation engine, I have chosen the nine continuous variables: **danceability**, **energy**, **loudness**, **speechiness**, **acousticness**, **instrumentalness**, **liveness**, **valence**, and **tempo**. Similarity scores are typically calculated using some form of distance, which often requires equivalent units. However, we quickly see that unlike the others, **loudness** and **tempo** (BPM) are not on a scale of 0-1.
+
+In order to normalize and scale **loudness** and **tempo**, I approximate the population mean and standard deviations for all songs by taking a random sample of 1000 songs. The random sampling code generates a random string of three letters, and a random integer *n* between 1 and 10, then selects the *n*th result of searching the string. This method of randomly generating Spotify songs was recommended in [this  Reddit thread](https://www.reddit.com/r/spotify/comments/i9e9or/is_there_a_way_to_play_a_completely_random_song/). Interestingly, the mean **tempo** across 1000 songs is 119.72 BPM, which makes sense since 120 BPM is a common default setting for digital audio workstations. 
+
+```{r random, eval=FALSE}
+random_s <- randomStrings(1000, len = 3, digits = FALSE)
+random_n <- randomNumbers(1000, min = 1, max = 10, col = 1)
+random_tracks <- NULL
+for (i in 1:1000){
+  curr_track <- get_track_audio_features(search_spotify(random_s[i], "track")[random_n[i],]$id)
+  if(ncol(curr_track)==18){
+    random_tracks <- rbind(random_tracks, curr_track)
+  }
+}
+mean_tempo <- mean(random_tracks$tempo)
+sd_tempo <- sd(random_tracks$tempo)
+mean_loudness <- mean(random_tracks$loudness)
+sd_loudness <- sd(random_tracks$loudness)
+```
+
+###Correlation Matrix
+Next, we will make a correlation matrix amongst the nine features to test for independence. As shown below, some of the variables are strongly correlated to one another (namely **energy/loudness**, **acousticness/energy**, and **instrumentalness/loudness**). Because of this, we cannot directly measure distance between two 9-feature vectors, since that would not account for interaction and would essentially double-count some variables if they are related.
+
+```{r cor matrix, echo=FALSE}
+load("random.RData")
+cor_table <- cor(random_tracks[c(1,2,4,6:11)])
+ggcorrplot(cor(random_tracks[c(1,2,4,6:11)]), outline.col = "white", type = "upper", title = "Correlations between Spotify's nine audio features", lab=TRUE, lab_col = "gray15")
+```
+
+##Recommendation Algorithm
+###Related Songs Database
+To build out the database of songs to select from, I use the `get_related_artists()` and `get_artist_top_tracks()` functions to select the top tracks from artists most similar to Kane Brown. Next, I remove any duplicate songs, then add columns for normalized **tempo** and **loudness**. This should come out to roughly ~200 songs, with the necessary features for calculating similarity.
+```{r database build}
+#Add tracks from current artist
+possible_tracks <- track
+curr_artist_tracks <- get_artist_top_tracks(artist_id)
+curr_artist_tracks <- get_features(curr_artist_tracks)
+possible_tracks <- rbind(possible_tracks, curr_artist_tracks)
+
+#Get similar artists and their top tracks. If not enough, returns "Not enough similar artists"
+similar_artists_id <- get_related_artists(artist_id)$id
+if (is.null(similar_artists_id)){
+  print(paste("Not enough similar artists to", paste(c(track$artists[[1]]$name), collapse=", "), "to generate recommendations for", track$name, "by", paste(c(track$artists[[1]]$name), collapse=", ")))
+}
+for (i in similar_artists_id){
+  curr_artist_tracks <- get_artist_top_tracks(i)
+  curr_artist_tracks <- get_features(curr_artist_tracks)
+  possible_tracks <- rbind(possible_tracks, curr_artist_tracks)
+}
+
+#Remove duplicates, normalize tempo
+possible_tracks <- possible_tracks %>% 
+  distinct(id, .keep_all = TRUE)
+possible_tracks$norm_tempo <- pnorm(possible_tracks$tempo, mean_tempo, sd_tempo, lower.tail = TRUE)
+possible_tracks$norm_loudness <- pnorm(possible_tracks$loudness, mean_loudness, sd_loudness, lower.tail = TRUE)
+```
+
+###Dimensionality Reduction
+As mentioned above, given that several variables are correlated with each other, dimensionality reduction is necessary to ensure that features are not double-counted. For this recommendation engine, we will use **principal component analysis** `prcomp()` to reduce the nine features into two variables, then calculate the distance between two points on the (PC1, PC2) plane.
+```{r rename artists, echo=FALSE}
+#Rename artists column
+for (i in 2:nrow(possible_tracks)){
+  possible_tracks$artists[[i]] <- paste(c(possible_tracks$artists[[i]]$name), collapse=", ")
+}
+```
+
+```{r dimensions}
+#Dimensionality reduction: principal component analysis
+pca_tracks <- prcomp(possible_tracks[, c(10,11,15:19,21,22)])
+pca_tracks <- data.frame(
+  PC1 = pca_tracks$x[, 1],
+  PC2 = pca_tracks$x[, 2],
+  name = possible_tracks$name
+)
+
+#Calculate similarity using Euclidean distance
+possible_tracks$distance <- round(sqrt((pca_tracks$PC1-pca_tracks$PC1[[1]])^2 + (pca_tracks$PC2-pca_tracks$PC2[[1]])^2), 2)
+
+#Plot the points
+pca_tracks$distance <- possible_tracks$distance
+pca_tracks$artists <- possible_tracks$artists
+plot <- ggplot(pca_tracks, aes(x = PC1, y = PC2, label = name, label2 = artists)) +
+  geom_point(data = pca_tracks[1,], color = "steelblue4", shape = 8, size = 3) + 
+  geom_point(data = pca_tracks[-1,], aes(color = distance)) +
+  labs(title = "Distance Between Songs on (PC1, PC2) Plane") +
+  scale_color_gradient(low = "steelblue4", high = "lightsteelblue1")
+ggplotly(plot)
+```
+
+###Generating Recommendations
+To get our final recommendations, we simply order the songs using smallest to largest distance from the originally selected track. In this case, the closest song is *10,000 Hours* by Dan + Shay and Justin Bieber, which, similar to *Be Like That*, is a chart-topping country-pop crossover. Rounding out the top 5 is more Dan + Shay, Kane Brown, and the pop-influenced country song *Slow Dance In A Parking Lot* by Jordan Davis. 
+```{r playlist top, echo=FALSE}
+playlist <- possible_tracks %>%
+  select(name, artists, album.name, popularity, distance) %>% 
+  rename(album = album.name) %>%
+  arrange(distance)
+kable(head(playlist,5), row.names = TRUE) %>%
+  kable_styling()
+```
+
+Looking at the bottom of the list, we see *10,000 Hours* again, this time the piano version, along with the acoustic version of Ryan Hurd's *Every Other Memory*, and Chris Lane's *Hero*. Each of these songs are heavily acoustic, a stark contrast from the pop-based beat of *Be Like That*, helping this recommendation engine pass the initial sniff test.
+```{r playlist bottom, echo=FALSE}
+kable(tail(playlist,3), row.names = TRUE) %>%
+  kable_styling()
+```
+
+###Resulting Playlist
+Finally, to build out the playlist, we take the original track plus its 49 most similar songs to create the 50-song playlist shown below. I have also built the recommendation engine into this [Shiny app here](https://johnnieteng.shinyapps.io/spotify_rec_shiny/), where you can try out the engine for yourself and get recommendations based on your favorite songs.
+```{r generate playlist}
+playlist <- possible_tracks %>%
+  select(name, artists, album.name, popularity, distance) %>% 
+  rename(album = album.name) %>%
+  arrange(distance) %>%
+  head(50)
+```
+```{r playlist view, echo=FALSE}
+kable(playlist, row.names = TRUE) %>%
+  kable_styling() %>%
+  kableExtra::scroll_box(height = "325px")
+```
+
+##Wrap-Up and Sources
+The original scope of this project was much bigger: I was reading [this research paper](https://arxiv.org/pdf/1106.0286.pdf) on the relationship between popularity and similarity in networks, explaining how nodes connect not only to popular nodes, but also nodes more similar to themselves, and how networks should optimize the trade-off between the two. I had planned on taking my own user data and look into how I weigh popularity and similarity in adding songs to my playlists across different genres. (Do I tend to add more popular hip-hop songs to my rap playlist? Do I add country songs based on similarity to my specific taste in country?) To build the engine, I envisioned taking the 9 features of a song and using a decision-trees classifier to predict what genre/playlist it would fit in, then weigh popularity and similarity accordingly. However, I quickly ran into issues, realizing that the 9 features were insufficient in predicting genres, with accuracy rates similar to those in [this study](https://www.kaylinpavlik.com/classifying-songs-genres/). Maybe flushing out a genre classifier will be my next research project!
+
+Overall, building out this recommendation engine was a fun exercise to do and demonstrate some of the data science and coding skills I have picked up in the past two or so years. Most of my data science projects in the past have been baseball-related and done privately for work, so it was nice to do a true public-data project for a change. Definitely looking forward to doing more of these and uploading them onto Github in the coming future!
+
+###Links
+**My Shiny app for the recommendation engine -  [https://johnnieteng.shinyapps.io/spotify_rec_shiny/](https://johnnieteng.shinyapps.io/spotify_rec_shiny/)**
+
+**Helpful Resources**
+
+* [https://www.rcharlie.com/spotifyr/](https://www.rcharlie.com/spotifyr/)
+* [https://developer.spotify.com/documentation/web-api/](https://developer.spotify.com/documentation/web-api/)
+* [https://rpubs.com/Saskia/520216](https://rpubs.com/Saskia/520216)
+* [https://arxiv.org/pdf/1106.0286.pdf](https://arxiv.org/pdf/1106.0286.pdf)
+* [https://www.kaylinpavlik.com/classifying-songs-genres/](https://www.kaylinpavlik.com/classifying-songs-genres/)
+* [https://towardsdatascience.com/country-wise-visual-analysis-of-music-taste-using-spotify-api-seaborn-in-python-77f5b749b421](https://towardsdatascience.com/country-wise-visual-analysis-of-music-taste-using-spotify-api-seaborn-in-python-77f5b749b421)
+
+
+Johnnie Teng, November 2020
